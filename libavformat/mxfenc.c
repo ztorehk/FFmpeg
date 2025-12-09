@@ -38,11 +38,13 @@
  */
 
 #include <inttypes.h>
+#include <ctype.h>
 #include <time.h>
 
 #include "libavutil/attributes_internal.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/avstring.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/timecode.h"
 #include "libavutil/avassert.h"
@@ -491,6 +493,20 @@ typedef struct MXFContext {
     int cbr_index;           ///< use a constant bitrate index
     uint8_t unused_tags[MXF_NUM_TAGS];  ///< local tags that we know will not be used
     MXFStreamContext timecode_track_priv;
+    /* identification overrides */
+    char *ident_company;
+    char *ident_product;
+    char *ident_product_version_str;
+    char *ident_toolkit_version_str;
+    char *ident_version_string;
+    char *ident_platform;
+    char *ident_product_uid_str;
+    uint8_t ident_product_uid[16];
+    int has_product_uid;
+    int ident_product_version_vals[5];
+    int ident_toolkit_version_vals[5];
+    int has_product_version_vals;
+    int has_toolkit_version_vals;
 } MXFContext;
 
 static void mxf_write_uuid(AVIOContext *pb, enum MXFMetadataSetType type, int value)
@@ -854,8 +870,63 @@ static void mxf_write_local_tag_utf16(AVFormatContext *s, int tag, const char *v
     avio_put_str16be(pb, value);
 }
 
-static void store_version(AVFormatContext *s){
+static int mxf_parse_version(const char *str, int out[5])
+{
+    int i = 0;
+    const char *p = str;
+
+    while (i < 5 && *p) {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > 0xFFFF)
+            return AVERROR(EINVAL);
+        out[i++] = (int)v;
+        if (*end == '.')
+            p = end + 1;
+        else if (*end == '\0')
+            break;
+        else
+            return AVERROR(EINVAL);
+    }
+    for (; i < 5; i++)
+        out[i] = 0;
+    return 0;
+}
+
+static int mxf_parse_uid(const char *str, uint8_t out[16])
+{
+    char hex[33];
+    int n = 0;
+
+    for (; *str && n < 32; str++) {
+        if ((*str >= '0' && *str <= '9') ||
+            (*str >= 'a' && *str <= 'f') ||
+            (*str >= 'A' && *str <= 'F')) {
+            hex[n++] = *str;
+        }
+    }
+
+    if (n != 32)
+        return AVERROR(EINVAL);
+
+    hex[32] = 0;
+    if (av_hex2bin(out, hex, 32) != 16)
+        return AVERROR(EINVAL);
+
+    return 0;
+}
+
+static void store_version(AVFormatContext *s, const int *override_version){
     AVIOContext *pb = s->pb;
+
+    if (override_version) {
+        avio_wb16(pb, override_version[0]); // major
+        avio_wb16(pb, override_version[1]); // minor
+        avio_wb16(pb, override_version[2]); // tertiary
+        avio_wb16(pb, override_version[3]); // patch
+        avio_wb16(pb, override_version[4]); // release
+        return;
+    }
 
     if (s->flags & AVFMT_FLAG_BITEXACT) {
         avio_wb16(pb, 0); // major
@@ -878,13 +949,20 @@ static void mxf_write_identification(AVFormatContext *s)
     AVDictionaryEntry *com_entry = av_dict_get(s->metadata, "company_name", NULL, 0);
     AVDictionaryEntry *product_entry = av_dict_get(s->metadata, "product_name", NULL, 0);
     AVDictionaryEntry *version_entry = av_dict_get(s->metadata, "product_version", NULL, 0);
-    const char *company = com_entry ? com_entry->value : "FFmpeg";
-    const char *product = product_entry ? product_entry->value : !IS_OPATOM(s) ? "OP1a Muxer" : "OPAtom Muxer";
-    const char *platform = s->flags & AVFMT_FLAG_BITEXACT ? "Lavf" : PLATFORM_IDENT;
-    const char *version = version_entry ? version_entry->value :
-                              s->flags & AVFMT_FLAG_BITEXACT ? "0.0.0" :
-                                  AV_STRINGIFY(LIBAVFORMAT_VERSION);
+    const char *company = mxf->ident_company ? mxf->ident_company :
+                          com_entry ? com_entry->value : "FFmpeg";
+    const char *product = mxf->ident_product ? mxf->ident_product :
+                          product_entry ? product_entry->value :
+                          !IS_OPATOM(s) ? "OP1a Muxer" : "OPAtom Muxer";
+    const char *platform = mxf->ident_platform ? mxf->ident_platform :
+                           s->flags & AVFMT_FLAG_BITEXACT ? "Lavf" : PLATFORM_IDENT;
+    const char *version = mxf->ident_version_string ? mxf->ident_version_string :
+                          mxf->ident_product_version_str ? mxf->ident_product_version_str :
+                          version_entry ? version_entry->value :
+                          s->flags & AVFMT_FLAG_BITEXACT ? "0.0.0" :
+                          AV_STRINGIFY(LIBAVFORMAT_VERSION);
     int length;
+    const uint8_t *product_uid_to_write = mxf->has_product_uid ? mxf->ident_product_uid : product_uid;
 
     mxf_write_metadata_key(pb, 0x013000);
     PRINT_KEY(s, "identification key", pb->buf_ptr - 16);
@@ -907,21 +985,21 @@ static void mxf_write_identification(AVFormatContext *s)
     mxf_write_local_tag_utf16(s, 0x3C02, product); // Product Name
 
     mxf_write_local_tag(s, 10, 0x3C03); // Product Version
-    store_version(s);
+    store_version(s, mxf->has_product_version_vals ? mxf->ident_product_version_vals : NULL);
 
     mxf_write_local_tag_utf16(s, 0x3C04, version); // Version String
     mxf_write_local_tag_utf16(s, 0x3C08, platform); // Platform
 
     // write product uid
     mxf_write_local_tag(s, 16, 0x3C05);
-    avio_write(pb, product_uid, 16);
+    avio_write(pb, product_uid_to_write, 16);
 
     // modification date
     mxf_write_local_tag(s, 8, 0x3C06);
     avio_wb64(pb, mxf->timestamp);
 
     mxf_write_local_tag(s, 10, 0x3C07); // Toolkit Version
-    store_version(s);
+    store_version(s, mxf->has_toolkit_version_vals ? mxf->ident_toolkit_version_vals : NULL);
 }
 
 static void mxf_write_content_storage(AVFormatContext *s, MXFPackage *packages, int package_count)
@@ -2951,6 +3029,33 @@ static int mxf_init(AVFormatContext *s)
     if (!av_dict_get(s->metadata, "comment_", NULL, AV_DICT_IGNORE_SUFFIX))
         mxf->store_user_comments = 0;
 
+    if (mxf->ident_product_uid_str) {
+        ret = mxf_parse_uid(mxf->ident_product_uid_str, mxf->ident_product_uid);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "invalid mxf_product_uid, expected 16-byte hex\n");
+            return ret;
+        }
+        mxf->has_product_uid = 1;
+    }
+
+    if (mxf->ident_product_version_str) {
+        ret = mxf_parse_version(mxf->ident_product_version_str, mxf->ident_product_version_vals);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "invalid mxf_product_version, expected a.b.c.d.e with 0-65535 parts\n");
+            return ret;
+        }
+        mxf->has_product_version_vals = 1;
+    }
+
+    if (mxf->ident_toolkit_version_str) {
+        ret = mxf_parse_version(mxf->ident_toolkit_version_str, mxf->ident_toolkit_version_vals);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "invalid mxf_toolkit_version, expected a.b.c.d.e with 0-65535 parts\n");
+            return ret;
+        }
+        mxf->has_toolkit_version_vals = 1;
+    }
+
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *st = s->streams[i];
         MXFStreamContext *sc = av_mallocz(sizeof(*sc));
@@ -3660,6 +3765,20 @@ static const AVOption mxf_options[] = {
     MXF_COMMON_OPTIONS
     { "store_user_comments", "",
       offsetof(MXFContext, store_user_comments), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM},
+    { "mxf_company_name", "Override MXF identification Company Name",
+      offsetof(MXFContext, ident_company), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_name", "Override MXF identification Product Name",
+      offsetof(MXFContext, ident_product), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_version", "Override MXF Product Version (a.b.c.d.e and Version String)",
+      offsetof(MXFContext, ident_product_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_version_string", "Override MXF Version String (3C04)",
+      offsetof(MXFContext, ident_version_string), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_platform", "Override MXF identification Platform string",
+      offsetof(MXFContext, ident_platform), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_toolkit_version", "Override MXF Toolkit Version (a.b.c.d.e)",
+      offsetof(MXFContext, ident_toolkit_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_uid", "Override MXF Product UID (16-byte hex, separators ignored)",
+      offsetof(MXFContext, ident_product_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
 };
 
@@ -3676,6 +3795,20 @@ static const AVOption d10_options[] = {
     MXF_COMMON_OPTIONS
     { "store_user_comments", "",
       offsetof(MXFContext, store_user_comments), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM},
+    { "mxf_company_name", "Override MXF identification Company Name",
+      offsetof(MXFContext, ident_company), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_name", "Override MXF identification Product Name",
+      offsetof(MXFContext, ident_product), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_version", "Override MXF Product Version (a.b.c.d.e and Version String)",
+      offsetof(MXFContext, ident_product_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_version_string", "Override MXF Version String (3C04)",
+      offsetof(MXFContext, ident_version_string), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_platform", "Override MXF identification Platform string",
+      offsetof(MXFContext, ident_platform), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_toolkit_version", "Override MXF Toolkit Version (a.b.c.d.e)",
+      offsetof(MXFContext, ident_toolkit_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_uid", "Override MXF Product UID (16-byte hex, separators ignored)",
+      offsetof(MXFContext, ident_product_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
 };
 
@@ -3692,6 +3825,20 @@ static const AVOption opatom_options[] = {
     MXF_COMMON_OPTIONS
     { "store_user_comments", "",
       offsetof(MXFContext, store_user_comments), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM},
+    { "mxf_company_name", "Override MXF identification Company Name",
+      offsetof(MXFContext, ident_company), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_name", "Override MXF identification Product Name",
+      offsetof(MXFContext, ident_product), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_version", "Override MXF Product Version (a.b.c.d.e and Version String)",
+      offsetof(MXFContext, ident_product_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_version_string", "Override MXF Version String (3C04)",
+      offsetof(MXFContext, ident_version_string), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_platform", "Override MXF identification Platform string",
+      offsetof(MXFContext, ident_platform), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_toolkit_version", "Override MXF Toolkit Version (a.b.c.d.e)",
+      offsetof(MXFContext, ident_toolkit_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_product_uid", "Override MXF Product UID (16-byte hex, separators ignored)",
+      offsetof(MXFContext, ident_product_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
 };
 
