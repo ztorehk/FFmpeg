@@ -45,6 +45,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/avstring.h"
+#include "libavutil/common.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/timecode.h"
 #include "libavutil/avassert.h"
@@ -910,9 +911,15 @@ static int mxf_parse_uid(const char *str, uint8_t out[16])
         return AVERROR(EINVAL);
 
     hex[32] = 0;
-    if (av_hex2bin(out, hex, 32) != 16)
-        return AVERROR(EINVAL);
-
+    for (int i = 0; i < 16; i++) {
+        int hi = av_toupper(hex[i * 2]);
+        int lo = av_toupper(hex[i * 2 + 1]);
+        if (!av_isxdigit(hi) || !av_isxdigit(lo))
+            return AVERROR(EINVAL);
+        hi = (hi <= '9') ? hi - '0' : hi - 'A' + 10;
+        lo = (lo <= '9') ? lo - '0' : lo - 'A' + 10;
+        out[i] = (hi << 4) | lo;
+    }
     return 0;
 }
 
