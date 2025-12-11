@@ -508,6 +508,20 @@ typedef struct MXFContext {
     int ident_toolkit_version_vals[5];
     int has_product_version_vals;
     int has_toolkit_version_vals;
+    /* UID overrides */
+    char *ident_uid_str;
+    uint8_t ident_uid[16];
+    int has_ident_uid;
+    char *ident_generation_uid_str;
+    uint8_t ident_generation_uid[16];
+    int has_ident_generation_uid;
+    char *material_umid_str;
+    uint8_t material_umid[32];
+    int has_material_umid;
+    int has_instance_number;
+    int instance_number_opt;
+    int adobe_track_ids;
+    int default_bt709;
 } MXFContext;
 
 static void mxf_write_uuid(AVIOContext *pb, enum MXFMetadataSetType type, int value)
@@ -524,6 +538,19 @@ static void mxf_write_umid(AVFormatContext *s, int type)
     avio_wb24(s->pb, mxf->instance_number);
     avio_write(s->pb, mxf->umid, 15);
     avio_w8(s->pb, type);
+}
+
+static void mxf_write_package_umid(AVFormatContext *s, int instance, int is_material)
+{
+    MXFContext *mxf = s->priv_data;
+
+    if (is_material && mxf->has_material_umid) {
+        /* write caller-provided 32-byte UMID verbatim */
+        avio_write(s->pb, mxf->material_umid, 32);
+        return;
+    }
+
+    mxf_write_umid(s, instance);
 }
 
 static void mxf_write_refs_count(AVIOContext *pb, int ref_count)
@@ -781,7 +808,7 @@ static void mxf_write_preface(AVFormatContext *s)
 
     // write version
     mxf_write_local_tag(s, 2, 0x3B05);
-    avio_wb16(pb, 259); // v1.3
+    avio_wb16(pb, 0x0102); // v1.2
 
     // Object Model Version
     mxf_write_local_tag(s, 4, 0x3B07);
@@ -790,7 +817,10 @@ static void mxf_write_preface(AVFormatContext *s)
     // write identification_refs
     mxf_write_local_tag(s, 16 + 8, 0x3B06);
     mxf_write_refs_count(pb, 1);
-    mxf_write_uuid(pb, Identification, 0);
+    if (mxf->has_ident_uid)
+        avio_write(pb, mxf->ident_uid, 16);
+    else
+        mxf_write_uuid(pb, Identification, 0);
 
     // write content_storage_refs
     mxf_write_local_tag(s, 16, 0x3B03);
@@ -894,12 +924,13 @@ static int mxf_parse_version(const char *str, int out[5])
     return 0;
 }
 
-static int mxf_parse_uid(const char *str, uint8_t out[16])
+static int mxf_parse_hex(const char *str, uint8_t *out, int expected_len)
 {
-    char hex[33];
+    const int need = expected_len * 2;
+    char hex[65];
     int n = 0;
 
-    for (; *str && n < 32; str++) {
+    for (; *str && n < need; str++) {
         if ((*str >= '0' && *str <= '9') ||
             (*str >= 'a' && *str <= 'f') ||
             (*str >= 'A' && *str <= 'F')) {
@@ -907,11 +938,11 @@ static int mxf_parse_uid(const char *str, uint8_t out[16])
         }
     }
 
-    if (n != 32)
+    if (n != need)
         return AVERROR(EINVAL);
 
-    hex[32] = 0;
-    for (int i = 0; i < 16; i++) {
+    hex[need] = 0;
+    for (int i = 0; i < expected_len; i++) {
         int hi = av_toupper(hex[i * 2]);
         int lo = av_toupper(hex[i * 2 + 1]);
         if (!av_isxdigit(hi) || !av_isxdigit(lo))
@@ -921,6 +952,11 @@ static int mxf_parse_uid(const char *str, uint8_t out[16])
         out[i] = (hi << 4) | lo;
     }
     return 0;
+}
+
+static int mxf_parse_uid(const char *str, uint8_t out[16])
+{
+    return mxf_parse_hex(str, out, 16);
 }
 
 static void store_version(AVFormatContext *s, const int *override_version){
@@ -982,12 +1018,18 @@ static void mxf_write_identification(AVFormatContext *s)
 
     // write uid
     mxf_write_local_tag(s, 16, 0x3C0A);
-    mxf_write_uuid(pb, Identification, 0);
+    if (mxf->has_ident_uid)
+        avio_write(pb, mxf->ident_uid, 16);
+    else
+        mxf_write_uuid(pb, Identification, 0);
     PRINT_KEY(s, "identification uid", pb->buf_ptr - 16);
 
     // write generation uid
     mxf_write_local_tag(s, 16, 0x3C09);
-    mxf_write_uuid(pb, Identification, 1);
+    if (mxf->has_ident_generation_uid)
+        avio_write(pb, mxf->ident_generation_uid, 16);
+    else
+        mxf_write_uuid(pb, Identification, 1);
     mxf_write_local_tag_utf16(s, 0x3C01, company); // Company Name
     mxf_write_local_tag_utf16(s, 0x3C02, product); // Product Name
 
@@ -1036,6 +1078,31 @@ static void mxf_write_content_storage(AVFormatContext *s, MXFPackage *packages, 
     mxf_write_uuid(pb, EssenceContainerData, 0);
 }
 
+static int mxf_get_track_id(AVFormatContext *s, AVStream *st)
+{
+    MXFContext *mxf = s->priv_data;
+
+    if (st == mxf->timecode_track)
+        return 0; // show as 0-Material/0-Source
+
+    if (!mxf->adobe_track_ids || IS_OPATOM(s))
+        return st->index + 2;
+
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+        return 512;
+
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        int audio_idx = 0;
+        for (int i = 0; i < st->index; i++) {
+            if (s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                audio_idx++;
+        }
+        return 768 + 256 * audio_idx;
+    }
+
+    return st->index + 2;
+}
+
 static void mxf_write_track(AVFormatContext *s, AVStream *st, MXFPackage *package)
 {
     MXFContext *mxf = s->priv_data;
@@ -1053,7 +1120,7 @@ static void mxf_write_track(AVFormatContext *s, AVStream *st, MXFPackage *packag
 
     // write track id
     mxf_write_local_tag(s, 4, 0x4801);
-    avio_wb32(pb, st->index+2);
+    avio_wb32(pb, mxf_get_track_id(s, st));
 
     // write track number
     mxf_write_local_tag(s, 4, 0x4804);
@@ -1196,7 +1263,7 @@ static void mxf_write_structural_component(AVFormatContext *s, AVStream *st, MXF
     if (package->type == SourcePackage && !package->ref)
         avio_wb32(pb, 0);
     else
-        avio_wb32(pb, st->index+2);
+        avio_wb32(pb, mxf_get_track_id(s, st));
 }
 
 static void mxf_write_tape_descriptor(AVFormatContext *s)
@@ -1264,7 +1331,7 @@ static int64_t mxf_write_generic_desc(AVFormatContext *s, AVStream *st, const UI
     mxf_write_uuid(pb, SubDescriptor, st->index);
 
     mxf_write_local_tag(s, 4, 0x3006);
-    avio_wb32(pb, st->index+2);
+    avio_wb32(pb, mxf_get_track_id(s, st));
 
     mxf_write_local_tag(s, 8, 0x3001);
     if (IS_D10(s)) {
@@ -1324,6 +1391,9 @@ static int64_t mxf_write_generic_picture_desc(AVFormatContext *s, AVStream *st)
     int64_t pos = mxf_write_generic_desc(s, st, *sc->picture_descriptor_key);
     const AVPacketSideData *side_data;
     int component_depth = pix_desc->comp[0].depth;
+
+    if (!sc->signal_standard && !IS_OPATOM(s) && st->codecpar->height == 1080)
+        sc->signal_standard = 4; // SMPTE 274M (Component)
 
     color_primaries_ul = mxf_get_codec_ul_by_id(ff_mxf_color_primaries_uls, st->codecpar->color_primaries);
     color_trc_ul       = mxf_get_codec_ul_by_id(ff_mxf_color_trc_uls, st->codecpar->color_trc);
@@ -1930,7 +2000,7 @@ static int mxf_write_package(AVFormatContext *s, MXFPackage *package)
 
     // write package umid
     mxf_write_local_tag(s, 32, 0x4401);
-    mxf_write_umid(s, package->instance);
+    mxf_write_package_umid(s, package->instance, package->type == MaterialPackage);
     PRINT_KEY(s, "package umid second part", pb->buf_ptr - 16);
 
     // package name
@@ -2066,6 +2136,12 @@ static int mxf_write_header_metadata_sets(AVFormatContext *s)
         packages[1].ref = &packages[2];
         package_count = 3;
     }
+
+    /* defaults if not provided */
+    if (!packages[0].name)
+        packages[0].name = av_strdup("Source Package");
+    if (!packages[1].name)
+        packages[1].name = av_strdup("Source Package");
 
     mxf_write_preface(s);
     mxf_write_identification(s);
@@ -2314,7 +2390,7 @@ static int mxf_write_partition(AVFormatContext *s, int bodysid,
 
     // write partition value
     avio_wb16(pb, 1); // majorVersion
-    avio_wb16(pb, 3); // minorVersion
+    avio_wb16(pb, 2); // minorVersion
     avio_wb32(pb, KAG_SIZE); // KAGSize
 
     avio_wb64(pb, partition_offset); // ThisPartition
@@ -2967,7 +3043,8 @@ static void mxf_gen_umid(AVFormatContext *s)
     AV_WB64(mxf->umid  , umid);
     AV_WB64(mxf->umid+8, umid>>8);
 
-    mxf->instance_number = seed & 0xFFFFFF;
+    if (!mxf->has_instance_number)
+        mxf->instance_number = seed & 0xFFFFFF;
 }
 
 static int mxf_init_timecode(AVFormatContext *s, AVStream *st, AVRational tbc)
@@ -3043,6 +3120,52 @@ static int mxf_init(AVFormatContext *s)
             return ret;
         }
         mxf->has_product_uid = 1;
+    }
+
+    if (mxf->ident_uid_str) {
+        ret = mxf_parse_uid(mxf->ident_uid_str, mxf->ident_uid);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "invalid mxf_identification_uid, expected 16-byte hex\n");
+            return ret;
+        }
+        mxf->has_ident_uid = 1;
+    }
+
+    if (mxf->ident_generation_uid_str) {
+        ret = mxf_parse_uid(mxf->ident_generation_uid_str, mxf->ident_generation_uid);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "invalid mxf_generation_uid, expected 16-byte hex\n");
+            return ret;
+        }
+        mxf->has_ident_generation_uid = 1;
+    }
+
+    if (mxf->material_umid_str) {
+        ret = mxf_parse_hex(mxf->material_umid_str, mxf->material_umid, 32);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "invalid mxf_material_umid, expected 32-byte hex\n");
+            return ret;
+        }
+        mxf->has_material_umid = 1;
+    }
+
+    if (mxf->instance_number_opt >= 0) {
+        mxf->instance_number = mxf->instance_number_opt & 0xFFFFFF;
+        mxf->has_instance_number = 1;
+    }
+
+    /* Default HD to BT.709 if unspecified, so MediaInfo shows BT.709 primaries/TRC */
+    if (mxf->default_bt709) {
+        for (i = 0; i < s->nb_streams; i++) {
+            AVStream *st = s->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED)
+                    st->codecpar->color_primaries = AVCOL_PRI_BT709;
+                if (st->codecpar->color_trc == AVCOL_TRC_UNSPECIFIED)
+                    st->codecpar->color_trc = AVCOL_TRC_BT709;
+                /* Do not force matrix to avoid MediaInfo showing Matrix coefficients */
+            }
+        }
     }
 
     if (mxf->ident_product_version_str) {
@@ -3143,6 +3266,8 @@ static int mxf_init(AVFormatContext *s)
             }
             if (mxf->signal_standard >= 0)
                 sc->signal_standard = mxf->signal_standard;
+            else if (st->codecpar->height == 1080)
+                sc->signal_standard = 4; // SMPTE 274M (Component)
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             char bsf_arg[32];
             if (st->codecpar->sample_rate != 48000) {
@@ -3272,6 +3397,7 @@ static int mxf_init(AVFormatContext *s)
         return AVERROR(ENOMEM);
     mxf->timecode_track->priv_data = &mxf->timecode_track_priv;
     mxf->timecode_track->index = -1;
+    av_dict_set(&mxf->timecode_track->metadata, "title", "Timecode", 0);
 
     return 0;
 }
@@ -3786,6 +3912,18 @@ static const AVOption mxf_options[] = {
       offsetof(MXFContext, ident_toolkit_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { "mxf_product_uid", "Override MXF Product UID (16-byte hex, separators ignored)",
       offsetof(MXFContext, ident_product_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_identification_uid", "Override Identification UID (3C0A) 16-byte hex",
+      offsetof(MXFContext, ident_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_generation_uid", "Override Generation UID (3C09) 16-byte hex",
+      offsetof(MXFContext, ident_generation_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_material_umid", "Override Material Package UMID (32-byte hex, full UMID)",
+      offsetof(MXFContext, material_umid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_instance_number", "Override instance number used in UMIDs (0-16777215)",
+      offsetof(MXFContext, instance_number_opt), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 0xFFFFFF, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_adobe_track_ids", "Use Adobe-like track IDs (video=512, audio=768/1024/1280/1536...)",
+      offsetof(MXFContext, adobe_track_ids), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_default_bt709", "Force BT.709 primaries/TRC/matrix when unspecified",
+      offsetof(MXFContext, default_bt709), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
 };
 
@@ -3816,6 +3954,16 @@ static const AVOption d10_options[] = {
       offsetof(MXFContext, ident_toolkit_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { "mxf_product_uid", "Override MXF Product UID (16-byte hex, separators ignored)",
       offsetof(MXFContext, ident_product_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_identification_uid", "Override Identification UID (3C0A) 16-byte hex",
+      offsetof(MXFContext, ident_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_generation_uid", "Override Generation UID (3C09) 16-byte hex",
+      offsetof(MXFContext, ident_generation_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_material_umid", "Override Material Package UMID (32-byte hex, full UMID)",
+      offsetof(MXFContext, material_umid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_instance_number", "Override instance number used in UMIDs (0-16777215)",
+      offsetof(MXFContext, instance_number_opt), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 0xFFFFFF, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_adobe_track_ids", "Use Adobe-like track IDs (video=512, audio=768/1024/1280/1536...)",
+      offsetof(MXFContext, adobe_track_ids), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
 };
 
@@ -3846,6 +3994,16 @@ static const AVOption opatom_options[] = {
       offsetof(MXFContext, ident_toolkit_version_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { "mxf_product_uid", "Override MXF Product UID (16-byte hex, separators ignored)",
       offsetof(MXFContext, ident_product_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_identification_uid", "Override Identification UID (3C0A) 16-byte hex",
+      offsetof(MXFContext, ident_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_generation_uid", "Override Generation UID (3C09) 16-byte hex",
+      offsetof(MXFContext, ident_generation_uid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_material_umid", "Override Material Package UMID (32-byte hex, full UMID)",
+      offsetof(MXFContext, material_umid_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_instance_number", "Override instance number used in UMIDs (0-16777215)",
+      offsetof(MXFContext, instance_number_opt), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 0xFFFFFF, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mxf_adobe_track_ids", "Use Adobe-like track IDs (video=512, audio=768/1024/1280/1536...)",
+      offsetof(MXFContext, adobe_track_ids), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
 };
 
